@@ -1,0 +1,394 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from rplidar import RPLidar, RPLidarException
+import threading
+import time
+from sklearn.cluster import DBSCAN  # <--- Algoritmul profesional de grupare
+
+# --- CONFIGURĂRI ---
+PORT_NAME = 'COM4'
+BAUD_RATE = 115200
+MAX_DISTANCE = 4000
+MIN_DISTANCE = 10   # Zona moartă 50cm
+
+# --- CONFIGURĂRI DBSCAN (Aici e "magia" de pe GitHub) ---
+# EPS: Distanța maximă între două puncte ca să fie considerate "prietene" (parte din același obiect).
+# 300mm = 30cm. Dacă punctele sunt mai departe de 30cm, sunt obiecte diferite.
+CLUSTER_EPS = 300       
+
+# MIN_SAMPLES: Câte puncte minim trebuie să aibă un obiect.
+# Sub 4 puncte = Zgomot (nu desenăm).
+CLUSTER_MIN_SAMPLES = 4 
+
+THRESHOLD = 300 # Sensibilitate față de perete
+
+class LidarProfessional:
+    def __init__(self):
+        # Grafică
+        self.fig = plt.figure(figsize=(10, 10), facecolor='black')
+        self.ax = self.fig.add_subplot(111, projection='polar', facecolor='#001000')
+        self.ax.set_ylim(0, MAX_DISTANCE)
+        self.ax.grid(color='green', alpha=0.3)
+        self.ax.set_yticklabels([])
+
+        # Elemente vizuale
+        self.scat_static = self.ax.scatter([], [], s=5, c='#004400', alpha=0.5, label='Perete')
+        
+        # Obiectele vor fi cercuri mari roșii
+        self.scat_objects = self.ax.scatter([], [], s=200, c='red', marker='o', edgecolors='white', linewidth=2, zorder=10, label='OBIECT')
+        
+        # Text pentru numărul de obiecte
+        self.text_info = self.ax.text(0, 0, "", color="white", fontweight="bold", ha="center", va="center", transform=self.ax.transAxes)
+
+        self.ax.legend(loc='upper right', facecolor='black', labelcolor='white')
+
+        # Date
+        self.reference_map = np.zeros(360)
+        self.calibration_buffer = []
+        self.is_calibrated = False
+        self.lidar_running = True
+        
+        self.lock = threading.Lock()
+        self.scan_current = np.zeros(360)
+
+        threading.Thread(target=self.lidar_loop, daemon=True).start()
+
+    def lidar_loop(self):
+        print(f"Conectare la {PORT_NAME}...")
+        while self.lidar_running:
+            try:
+                lidar = RPLidar(PORT_NAME, baudrate=BAUD_RATE)
+                print(">> Senzor activ.")
+                for scan in lidar.iter_scans(max_buf_meas=1000, min_len=5):
+                    if not self.lidar_running: break
+                    
+                    temp = np.zeros(360)
+                    for (_, angle, dist) in scan:
+                        if MIN_DISTANCE < dist < MAX_DISTANCE:
+                            idx = int(angle) % 360
+                            temp[idx] = dist
+                    
+                    with self.lock:
+                        mask = temp > 0
+                        self.scan_current[mask] = temp[mask]
+                        
+            except Exception:
+                try: lidar.stop(); lidar.disconnect()
+                except: pass
+                time.sleep(1)
+
+    def process_clusters(self, angles, dists):
+        """
+        Transformă datele polare în X,Y și aplică DBSCAN.
+        Returnează doar centrele obiectelor reale.
+        """
+        if len(angles) == 0: return [], []
+
+        # 1. Transformăm Polar (Unghi, Distanță) -> Cartezian (X, Y)
+        # Matematica e necesară pentru DBSCAN
+        x = dists * np.cos(angles)
+        y = dists * np.sin(angles)
+        
+        # Creăm o listă de coordonate [[x1, y1], [x2, y2], ...]
+        X_data = np.column_stack((x, y))
+
+        # 2. Aplicăm algoritmul DBSCAN
+        # Acesta face toată treaba grea: grupează punctele și elimină zgomotul (-1)
+        # metric='euclidean' înseamnă că măsoară distanța în linie dreaptă (mm)
+        clustering = DBSCAN(eps=CLUSTER_EPS, min_samples=CLUSTER_MIN_SAMPLES, metric='euclidean').fit(X_data)
+        labels = clustering.labels_
+
+        # 3. Calculăm centrul fiecărui grup găsit
+        unique_labels = set(labels)
+        final_ang = []
+        final_dist = []
+
+        for label in unique_labels:
+            if label == -1: 
+                continue # -1 înseamnă ZGOMOT (puncte izolate), le ignorăm complet
+
+            # Luăm doar punctele care aparțin acestui obiect (cluster)
+            mask = (labels == label)
+            cluster_x = x[mask]
+            cluster_y = y[mask]
+
+            # Calculăm centrul geometric (centroid)
+            center_x = np.mean(cluster_x)
+            center_y = np.mean(cluster_y)
+
+            # Transformăm înapoi în Polar pentru a le desena pe radar
+            c_dist = np.sqrt(center_x**2 + center_y**2)
+            c_ang = np.arctan2(center_y, center_x)
+            
+            # Normalizăm unghiul să fie între 0 și 2pi
+            c_ang = c_ang % (2 * np.pi)
+
+            final_ang.append(c_ang)
+            final_dist.append(c_dist)
+
+        return final_ang, final_dist
+
+    def update(self, frame):
+        with self.lock:
+            data = np.copy(self.scan_current)
+            self.scan_current[self.scan_current > 0] -= 30 # Fade out
+
+        angles_rad = np.deg2rad(np.arange(360))
+
+        # --- CALIBRARE ---
+        if not self.is_calibrated:
+            if frame < 50:
+                self.ax.set_title(f"ÎNVĂȚARE MEDIU... {frame}/50", color='yellow')
+                if np.sum(data) > 0: self.calibration_buffer.append(data)
+                mask = data > 0
+                self.scat_static.set_offsets(np.c_[angles_rad[mask], data[mask]])
+                return self.scat_static, self.scat_objects, self.text_info
+            
+            else:
+                stack = np.vstack(self.calibration_buffer)
+                masked = np.ma.masked_equal(stack, 0)
+                self.reference_map = masked.mean(axis=0).filled(MAX_DISTANCE)
+                self.is_calibrated = True
+                print("✅ Gata! Sistemul rulează cu DBSCAN Clustering.")
+
+        # --- DETECȚIE INTELIGENTĂ ---
+        
+        # 1. Extragem punctele care sunt suspecte (diferite de perete)
+        candidate_ang = []
+        candidate_dist = []
+
+        for i in range(360):
+            r = data[i]
+            ref = self.reference_map[i]
+            if r > MIN_DISTANCE and ref < MAX_DISTANCE and r < (ref - THRESHOLD):
+                candidate_ang.append(angles_rad[i])
+                candidate_dist.append(r)
+
+        # 2. Le dăm la procesare prin DBSCAN
+        obj_ang, obj_dist = self.process_clusters(np.array(candidate_ang), np.array(candidate_dist))
+
+        # 3. Desenare
+        if len(obj_ang) > 0:
+            self.scat_objects.set_offsets(np.c_[obj_ang, obj_dist])
+            self.ax.set_title(f"⚠️ {len(obj_ang)} OBIECTE DETECTATE", color='red', fontweight='bold')
+        else:
+            self.scat_objects.set_offsets(np.empty((0, 2)))
+            self.ax.set_title("MONITORIZARE ACTIVĂ", color='#00ff00')
+
+        # Desenare fundal (doar ca referință vizuală, opțional)
+        # mask_bg = data > 0
+        # self.scat_static.set_offsets(np.c_[angles_rad[mask_bg], data[mask_bg]])
+
+        return self.scat_static, self.scat_objects, self.text_info
+
+    def run(self):
+        anim = FuncAnimation(self.fig, self.update, interval=30, blit=True)
+        plt.show()
+        self.lidar_running = False
+
+if __name__ == "__main__":
+    app = LidarProfessional()
+    app.run()
+
+    -----------------------------------------------------------------
+
+    import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from rplidar import RPLidar, RPLidarException
+import threading
+import time
+from sklearn.cluster import DBSCAN
+
+# --- CONFIGURĂRI ---
+PORT_NAME = 'COM4'
+BAUD_RATE = 115200
+MAX_DISTANCE = 4000
+MIN_DISTANCE = 10   
+CLUSTER_EPS = 300        
+CLUSTER_MIN_SAMPLES = 4 
+THRESHOLD = 200 # Am scazut putin pentru sensibilitate mai buna
+
+class LidarProfessional:
+    def __init__(self):
+        # Grafică
+        self.fig = plt.figure(figsize=(10, 10), facecolor='black')
+        self.ax = self.fig.add_subplot(111, projection='polar', facecolor='#001000')
+        self.ax.set_ylim(0, MAX_DISTANCE)
+        self.ax.grid(color='green', alpha=0.2)
+        self.ax.set_yticklabels([])
+
+        # --- MODIFICARE VIZUALĂ ---
+        # 1. Pereții (Static) - puncte mici, verzi, semi-transparente
+        self.scat_walls = self.ax.scatter([], [], s=10, c='#00FF00', alpha=0.4, marker='.', label='Perete / Mediu')
+        
+        # 2. Obiectele (Intrușii) - cercuri mari roșii
+        self.scat_objects = self.ax.scatter([], [], s=150, c='red', marker='o', edgecolors='white', linewidth=2, zorder=10, label='OBIECT DETECTAT')
+        
+        # Text status
+        self.text_info = self.ax.text(0.5, 0.05, "INIȚIALIZARE...", color="white", fontweight="bold", ha="center", transform=self.fig.transFigure, fontsize=14)
+
+        self.ax.legend(loc='upper right', facecolor='black', labelcolor='white')
+
+        # Date
+        self.reference_map = np.zeros(360)
+        self.calibration_buffer = []
+        self.is_calibrated = False
+        self.lidar_running = True
+        
+        self.lock = threading.Lock()
+        self.scan_current = np.zeros(360)
+
+        threading.Thread(target=self.lidar_loop, daemon=True).start()
+
+    def lidar_loop(self):
+        print(f"Conectare la {PORT_NAME}...")
+        while self.lidar_running:
+            try:
+                lidar = RPLidar(PORT_NAME, baudrate=BAUD_RATE)
+                print(">> Senzor activ.")
+                for scan in lidar.iter_scans(max_buf_meas=1000, min_len=5):
+                    if not self.lidar_running: break
+                    
+                    # Folosim un buffer temporar pentru a nu avea "găuri" în date
+                    temp = np.zeros(360)
+                    for (_, angle, dist) in scan:
+                        if MIN_DISTANCE < dist < MAX_DISTANCE:
+                            idx = int(angle) % 360
+                            temp[idx] = dist
+                    
+                    with self.lock:
+                        # --- FIX: NU mai facem fade out (scădere). Scriem direct datele noi.
+                        # Dacă senzorul vede ceva, actualizăm. Dacă e 0, păstrăm vechea valoare scurt timp (persistence)
+                        # Sau, pentru simplitate și acuratețe maximă, suprascriem doar ce e valid:
+                        mask = temp > 0
+                        self.scan_current[mask] = temp[mask]
+                        
+                        # Opțional: ștergem datele foarte vechi care nu s-au actualizat (curățare zgomot)
+                        # Dar pentru pereți stabili, e mai bine să lăsăm buffer-ul așa.
+                        
+            except Exception as e:
+                print(f"Eroare Lidar: {e}")
+                try: lidar.stop(); lidar.disconnect()
+                except: pass
+                time.sleep(1)
+
+    def process_clusters(self, angles, dists):
+        if len(angles) == 0: return [], []
+        x = dists * np.cos(angles)
+        y = dists * np.sin(angles)
+        X_data = np.column_stack((x, y))
+
+        try:
+            clustering = DBSCAN(eps=CLUSTER_EPS, min_samples=CLUSTER_MIN_SAMPLES, metric='euclidean').fit(X_data)
+        except:
+            return [], [] # Safety check
+
+        labels = clustering.labels_
+        unique_labels = set(labels)
+        final_ang = []
+        final_dist = []
+
+        for label in unique_labels:
+            if label == -1: continue 
+            mask = (labels == label)
+            center_x = np.mean(x[mask])
+            center_y = np.mean(y[mask])
+            c_dist = np.sqrt(center_x**2 + center_y**2)
+            c_ang = np.arctan2(center_y, center_x) % (2 * np.pi)
+            final_ang.append(c_ang)
+            final_dist.append(c_dist)
+
+        return final_ang, final_dist
+
+    def update(self, frame):
+        with self.lock:
+            # Copiem datele curente pentru a lucra cu ele
+            data = np.copy(self.scan_current)
+            # --- FIX: Am scos linia cu "-= 30" (Fade out) ---
+
+        angles_rad = np.deg2rad(np.arange(360))
+        mask_valid = data > 0
+
+        # --- CALIBRARE ---
+        if not self.is_calibrated:
+            if frame < 50:
+                self.text_info.set_text(f"CALIBRARE MEDIU... {frame * 2}%")
+                self.text_info.set_color('yellow')
+                if np.sum(data) > 0: self.calibration_buffer.append(data)
+                
+                # Desenăm ce vedem momentan ca să nu fie ecranul negru
+                self.scat_walls.set_offsets(np.c_[angles_rad[mask_valid], data[mask_valid]])
+                return self.scat_walls, self.scat_objects, self.text_info
+            
+            else:
+                stack = np.vstack(self.calibration_buffer)
+                masked = np.ma.masked_equal(stack, 0)
+                self.reference_map = masked.mean(axis=0).filled(MAX_DISTANCE)
+                self.is_calibrated = True
+                print("✅ Calibrare completă.")
+
+        # --- DETECȚIE ---
+        
+        # 1. Separăm punctele: Care sunt Pereți și care sunt Obiecte?
+        candidate_ang = []
+        candidate_dist = []
+        
+        wall_ang = []
+        wall_dist = []
+
+        for i in range(360):
+            r = data[i]
+            if r <= MIN_DISTANCE: continue # Ignorăm zona moartă
+
+            ref = self.reference_map[i]
+            
+            # LOGICA DE SELECȚIE:
+            # E obiect DACĂ: e valid ȘI e mult mai aproape decât peretele de referință
+            if ref < MAX_DISTANCE and r < (ref - THRESHOLD):
+                candidate_ang.append(angles_rad[i])
+                candidate_dist.append(r)
+            else:
+                # Altfel, considerăm că e perete (sau chiar peretele de referință)
+                # Îl adăugăm la lista de desenat pereți
+                wall_ang.append(angles_rad[i])
+                wall_dist.append(r)
+
+        # 2. Procesăm doar candidații prin DBSCAN
+        obj_ang, obj_dist = self.process_clusters(np.array(candidate_ang), np.array(candidate_dist))
+
+        # 3. ACTUALIZARE GRAFICĂ
+        
+        # A. Desenăm PEREȚII (Tot ce nu e obiect)
+        # Acum pereții vor fi mereu vizibili, stabili
+        if len(wall_ang) > 0:
+            self.scat_walls.set_offsets(np.c_[wall_ang, wall_dist])
+        else:
+             self.scat_walls.set_offsets(np.empty((0, 2)))
+
+        # B. Desenăm OBIECTELE (DBSCAN centroids)
+        if len(obj_ang) > 0:
+            self.scat_objects.set_offsets(np.c_[obj_ang, obj_dist])
+            self.text_info.set_text(f"⚠️ {len(obj_ang)} OBIECT(E) DETECTAT(E)!")
+            self.text_info.set_color('red')
+            
+            # Opțional: Schimbă culoarea fundalului axei pentru alertă
+            self.ax.set_facecolor('#1a0000') 
+        else:
+            self.scat_objects.set_offsets(np.empty((0, 2)))
+            self.text_info.set_text("MONITORIZARE ACTIVĂ - CAMERĂ SECURIZATĂ")
+            self.text_info.set_color('#00ff00')
+            self.ax.set_facecolor('#001000')
+
+        return self.scat_walls, self.scat_objects, self.text_info
+
+    def run(self):
+        # Blit=True e rapid, dar uneori face probleme cu textul. Dacă textul dispare, pune blit=False
+        anim = FuncAnimation(self.fig, self.update, interval=30, blit=False) 
+        plt.show()
+        self.lidar_running = False
+
+if __name__ == "__main__":
+    app = LidarProfessional()
+    app.run()
